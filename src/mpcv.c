@@ -147,8 +147,16 @@ static uint8_t tms_of(uint32_t rgb) {
 // see-through) has 0x80 too
 uint8_t mpcv_tile_tms[256], mpcv_spr_tms[256];
 static uint8_t tile_front[256];
-static uint8_t tile_blank[256];          // a bit a line (y % 8) of each tile: all of it pen 0
+static uint8_t tile_blank[256];          // a bit a line (y % 8) of each tile: all of it pen 0 (or text)
+static uint8_t tile_one[256];            // the pen of a tile that's all one pen (else 0xff)
+static uint8_t logo_tms[256];            // the title logo's sprite pens (its outline see-through)
 static bool pens_ready;
+static void text_init(void);
+static void spr_text_init(void);
+
+// MAPPY at the title: the letters' dark blue outline (left out)
+#define LOGO_OUTLINE 0x0000AEu
+#define GREY         14
 
 static void pens_init(void) {
     if (!colors_ready) colors_init();
@@ -156,22 +164,32 @@ static void pens_init(void) {
         mpcv_tile_tms[i] = tms_of(mp_rgb[i]);
         tile_front[i] = mp_tile_ctab[i] != 15 ? 0x80 : 0;
         mpcv_spr_tms[i] = mp_spr_ctab[i] == 15 ? 0 : tms_of(mp_rgb[256 + i]);
+        logo_tms[i] = mp_rgb[256 + i] == LOGO_OUTLINE ? 0 : mpcv_spr_tms[i];
     }
     for (int code = 0; code < 256; code++) {
         uint16_t any = 0;
-        for (int r = 0; r < 8; r++) any |= mp_tile_rows[code][r];
+        unsigned pens = 0;
+        for (int r = 0; r < 8; r++) {
+            any |= mp_tile_rows[code][r];
+            for (int y = 0; y < 8; y++) pens |= 1u << ((mp_tile_rows[code][r] >> (2 * y)) & 3);
+        }
         uint8_t m = 0;
         for (int y = 0; y < 8; y++)
             if (!((any >> (2 * y)) & 3)) m |= (uint8_t)(1u << y);
         tile_blank[code] = m;
+        tile_one[code] = (pens & (pens - 1)) ? 0xff : (uint8_t)__builtin_ctz(pens);
     }
+    text_init();
+    spr_text_init();
     pens_ready = true;
 }
 
 // ---- the picture's state -------------------------------------------------------------
 // The mansion: MAME's tiles turned, 480 x 256 (the world: its column U is
 // the tilemap's, so the screen's column X is U - (256 - scroll)), scaled
-// to 343 x 192 as TMS9918 colours (bit 7: in front of the sprites). Only
+// to 343 x 192 as TMS9918 colours (WP_FRONT: in front of the sprites;
+// WP_LOGO: the title's logo, whose places pick their two colours their own
+// way, span_logo). Only
 // the scaled columns from range_lo to range_hi are kept up to date: those
 // the console has shown since the last whole picture. The margins: x 0-47
 // and 208-255 (MX). The sprites' images are kept in scache.
@@ -183,6 +201,9 @@ static void pens_init(void) {
 #define PL     256                      // its lines (the screen's rows 2-33)
 #define MW     (MPCV_W - PF_W)
 #define MX(x)  ((x) < PF_X ? (x) : (x) - PF_W)
+#define WP_FRONT 0x80
+#define WP_LOGO  0x40
+#define WP_COLOR 0x0f
 
 typedef struct {
     uint32_t key;                       // what it was made from (0: nothing)
@@ -268,6 +289,248 @@ static void maps_init(void) {
 
 static const mpcv_board_t *bd;          // the board the picture is made from
 
+// ---- the mansion's text: its letters 6 x 6 ---------------------------------------------
+// Scaled with the mansion, a letter's 8 columns lose two wherever the grid
+// falls, and its strokes can run together ("2ND" read "RND", "1983"
+// "1985"). So text tiles are drawn blank by world_line and their letters
+// drawn over the scaled mansion 6 x 6 each (draw_text, below): two pairs
+// of its columns and two pairs of its lines made one (cvscale_pick), the
+// pairs chosen for each letter from its own pixels (the ROM's), so that
+// every row and column keeps its strokes and gaps (the same runs of pixels
+// on and off) and the fewest pixels are lost; test/mp/textcheck.c checks
+// every letter, digit and mark (the copyright sign, whose ring fills its
+// 8 x 8, is drawn 6 x 6 instead). Text tiles: 0-9 and A-F (0x00-0x0f, the
+// bonus scores' first digits and the self test's), '/' (0x2b), 0-9
+// (0x30-0x39), '!' and '?' (0x3e, 0x3f), the copyright sign and A-Z
+// (0x40-0x5a), '.' (0x5f). Their pens are 0 (paper) and 1 (ink).
+#define TEXT_SPACE 0x20
+#define COPYRIGHT  0x40
+#define TEXT_COLS  0x22                 // the pairs a letter's made from unless another's better:
+#define TEXT_LINES 0x12                 // columns 1-2 and 5-6, lines 1-2 and 4-5
+static bool is_text[256];
+static uint8_t glyph6[256][6];          // a text tile's letter: bit x of row y, x and y 0-5
+static uint8_t glyph_merge[256][2];     // its pairs made one: columns, lines (bit j: j and j + 1)
+
+static bool text_code(int code) {
+    return code < 0x10 || code == 0x2b || (code >= 0x30 && code <= 0x39) || code == 0x3e || code == 0x3f ||
+           (code >= 0x40 && code <= 0x5a) || code == 0x5f;
+}
+
+// 8 pixels (bit x: pixel x) with pairs made one (bit j of m: j and j + 1), as cvscale does
+static unsigned squeeze8(unsigned row, unsigned m) {
+    unsigned out = 0;
+    int k = 0;
+    for (int x = 0; x < 8; x++) {
+        if (x && (m >> (x - 1) & 1)) continue;
+        unsigned v = row >> x & 1;
+        if (m >> x & 1)
+            v = cvscale_pick((uint8_t)v, (uint8_t)(row >> (x + 1) & 1), (uint8_t)(x ? row >> (x - 1) & 1 : 0),
+                             (uint8_t)(x + 2 < 8 ? row >> (x + 2) & 1 : 0));
+        out |= v << k++;
+    }
+    return out;
+}
+
+// a line of n pixels' runs, as one number: its first pixel and how often it changes
+static int runs_of(unsigned row, int n) {
+    return (int)(row & 1) | __builtin_popcount((row ^ (row >> 1)) & ((1u << (n - 1)) - 1)) << 1;
+}
+
+// a letter's pixels (src: bit x of row y) with columns cm and lines lm made
+// one, in out; the rows and columns whose runs change (*lost: the pixels)
+static int glyph_squeeze(const unsigned *src, unsigned cm, unsigned lm, uint8_t *out, int *lost) {
+    unsigned h[8];
+    int bad = 0, n = 0;
+    for (int y = 0; y < 8; y++) {
+        h[y] = squeeze8(src[y], cm);
+        bad += runs_of(src[y], 8) != runs_of(h[y], 6);
+        n += __builtin_popcount((src[y] ^ (src[y] >> 1)) & cm);
+    }
+    memset(out, 0, 6);
+    for (int x = 0; x < 6; x++) {
+        unsigned col = 0;
+        for (int y = 0; y < 8; y++) col |= (h[y] >> x & 1) << y;
+        unsigned v = squeeze8(col, lm);
+        bad += runs_of(col, 8) != runs_of(v, 6);
+        n += __builtin_popcount((col ^ (col >> 1)) & lm);
+        for (int y = 0; y < 6; y++) out[y] |= (uint8_t)((v >> y & 1) << x);
+    }
+    *lost = n;
+    return bad;
+}
+
+static void text_init(void) {
+    unsigned sets[15];                  // two pairs of 8 pixels' that don't overlap
+    int ns = 0;
+    for (int i = 0; i < 7; i++)
+        for (int j = i + 2; j < 7; j++) sets[ns++] = 1u << i | 1u << j;
+    for (int code = 0; code < 256; code++) {
+        is_text[code] = text_code(code);
+        if (!is_text[code]) continue;
+        tile_blank[code] = 0xff;
+        unsigned src[8];
+        for (int y = 0; y < 8; y++) {
+            src[y] = 0;
+            for (int x = 0; x < 8; x++) src[y] |= (((mp_tile_rows[code][7 - x] >> (2 * y)) & 3) ? 1u : 0u) << x;
+        }
+        if (code == COPYRIGHT) {        // (its ring fills the 8 x 8: no two pairs keep it, so drawn)
+            static const uint8_t sign[6] = {0x1e, 0x21, 0x2d, 0x25, 0x2d, 0x1e};
+            memcpy(glyph6[code], sign, 6);
+            glyph_merge[code][0] = glyph_merge[code][1] = 0;
+            continue;
+        }
+        int best = -1;
+        for (int a = 0; a < ns; a++)
+            for (int b = 0; b < ns; b++) {
+                uint8_t o[6];
+                int lost, bad = glyph_squeeze(src, sets[a], sets[b], o, &lost);
+                int score = bad * 1000 + lost * 10 + (sets[a] != TEXT_COLS) + (sets[b] != TEXT_LINES);
+                if (best < 0 || score < best) {
+                    best = score;
+                    memcpy(glyph6[code], o, 6);
+                    glyph_merge[code][0] = (uint8_t)sets[a];
+                    glyph_merge[code][1] = (uint8_t)sets[b];
+                }
+            }
+    }
+}
+
+bool mpcv_text_glyph(int code, uint8_t rows[6], uint8_t *cols, uint8_t *lines) {
+    if (!pens_ready) pens_init();
+    if (code < 0 || code > 255 || !is_text[code]) return false;
+    memcpy(rows, glyph6[code], 6);
+    *cols = glyph_merge[code][0];
+    *lines = glyph_merge[code][1];
+    return true;
+}
+
+// ---- the sprites' numbers and letters -----------------------------------------------------
+// A sprite is 16 x 16 made 12 x 12 by making one pair in each 4 of its
+// columns and of its lines one (sprite_image). At the middle pair of each
+// 4, as for Mappy and the cats, the points' "200" read "2oo" and "x5" lost
+// its gaps. So each sprite of one or two pens (the points 100 to 500 and
+// x2 to x6, the bonus round's numbers, GAME OVER, the note) gets the pair
+// in each 4, of its columns and then of its lines, that keeps the most
+// rows and columns' strokes and gaps (the same runs of pens), then the
+// middle pairs, then the fewest pixels lost; the rest keep the middle pairs.
+// test/mp/textcheck.c prints them.
+#define SPR_PAIRS 0x2222                // pixels 1-2, 5-6, 9-10 and 13-14
+static uint16_t spr_merge[128][2];      // columns, lines (bit j: j and j + 1), unflipped
+
+// 16 pixels (every step-th) to 12, the pairs in m made one (cvscale_pick, with
+// the pixels either side, 0 beyond the edges)
+static void squeeze16(const uint8_t *in, int step, unsigned m, uint8_t *out, int ostep) {
+    int k = 0;
+    for (int x = 0; x < 16; x++) {
+        if (x && (m >> (x - 1) & 1)) continue;
+        uint8_t v = in[x * step];
+        if (m >> x & 1) v = cvscale_pick(v, in[(x + 1) * step], x ? in[(x - 1) * step] : 0, x < 14 ? in[(x + 2) * step] : 0);
+        out[k++ * ostep] = v;
+    }
+}
+
+// the same runs of values: a's 16 pixels (every sa-th) and b's 12?
+static bool same_runs(const uint8_t *a, int sa, const uint8_t *b) {
+    int j = 0;
+    for (int i = 0; i < 16; i++) {
+        if (i && a[i * sa] == a[(i - 1) * sa]) continue;
+        while (j < 12 && j && b[j] == b[j - 1]) j++;
+        if (j == 12 || b[j] != a[i * sa]) return false;
+        j++;
+    }
+    while (j < 12 && b[j] == b[j - 1]) j++;
+    return j == 12;
+}
+
+// the pairs for one way of a 16 x 16 (n lines of it, each 16 pixels every step-th, lines line apart)
+static unsigned spr_pairs(const uint8_t *img, int n, int step, int line) {
+    unsigned best_m = SPR_PAIRS;
+    long best = -1;
+    for (int c = 0; c < 81; c++) {
+        unsigned m = 1u << (c % 3) | 1u << (4 + c / 3 % 3) | 1u << (8 + c / 9 % 3) | 1u << (12 + c / 27);
+        long fails = 0, lost = 0;
+        for (int r = 0; r < n; r++) {
+            const uint8_t *in = img + r * line;
+            uint8_t o[12];
+            squeeze16(in, step, m, o, 1);
+            fails += !same_runs(in, step, o);
+            for (int j = 0; j < 15; j++) lost += (m >> j & 1) && in[j * step] != in[(j + 1) * step];
+        }
+        long score = fails * 65536 + (m != SPR_PAIRS) * 4096 + lost;
+        if (best < 0 || score < best) best = score, best_m = m;
+    }
+    return best_m;
+}
+
+static void spr_text_init(void) {
+    for (int code = 0; code < 128; code++) {
+        spr_merge[code][0] = spr_merge[code][1] = SPR_PAIRS;
+        uint8_t img[16][16];            // as sprite_image turns it, unflipped; pens + 1, 0 for none
+        unsigned used = 0;
+        for (int u = 0; u < 16; u++)
+            for (int v = 0; v < 16; v++) {
+                int pen = (int)(mp_sprite_rows[code][15 - u] >> (4 * v)) & 15;
+                img[v][u] = (uint8_t)(pen == 15 ? 0 : pen + 1);
+                if (pen != 15) used |= 1u << pen;
+            }
+        if (!used || __builtin_popcount(used) > 2) continue;
+        unsigned mc = spr_pairs(&img[0][0], 16, 1, 16);
+        uint8_t h[16][16];
+        for (int v = 0; v < 16; v++) squeeze16(img[v], 1, mc, h[v], 1);
+        spr_merge[code][0] = (uint16_t)mc;
+        spr_merge[code][1] = (uint16_t)spr_pairs(&h[0][0], 12, 16, 1);
+    }
+}
+
+// pairs as they fall when the sprite's flipped that way
+static unsigned mirror16(unsigned m) {
+    unsigned r = 0;
+    for (int j = 0; j < 15; j++)
+        if (m >> j & 1) r |= 1u << (14 - j);
+    return r;
+}
+
+bool mpcv_spr_glyph(int code, uint16_t *cols, uint16_t *lines) {
+    if (!pens_ready) pens_init();
+    if (code < 0 || code > 127) return false;
+    *cols = spr_merge[code][0];
+    *lines = spr_merge[code][1];
+    return true;
+}
+
+// ---- the title's logo --------------------------------------------------------------------
+// MAPPY at the title is 11 double-size sprites (codes 0x64-0x7c, there
+// and nowhere else), letters outlined dark blue over a grey shadow. They
+// go into the mansion before it's scaled (world_line), so they're on the
+// tiles' grid, as the arcade's picture scaled would be. The TMS9918 has
+// two colours in 8 pixels, too few for a letter, its outline, the shadow
+// and black, so the outline is left out (the black behind it shows), and
+// a place with more than two colours keeps the letters' first (span_logo).
+#define LOGO_CODE 0x60
+typedef struct {
+    int16_t u0, y0;                     // its top left in the mansion
+    uint8_t w, h;                       // turned: 16 or 32 each way
+    uint8_t code, color, flips;         // flips: 1 x, 2 y; sizes: 4 x, 8 y (the board's)
+    uint8_t pad;
+} logo_t;
+#define NLOGO 16
+static logo_t logo[NLOGO], logo_was[NLOGO];
+static int nlogo, nlogo_was;
+
+// where a logo sprite's pixel dx, dy (turned) is: its pen is
+// (rows[line] >> sh) & 15, and the next pixel along its line (dx + 1, in
+// the same 16 x 16) is at line + step
+static void logo_at(const logo_t *L, int dx, int dy, const uint64_t **rows, int *sh, int *line, int *step) {
+    static const uint8_t gfx_offs[2][2] = {{0, 1}, {2, 3}};
+    int flipx = L->flips & 1, flipy = L->flips >> 1 & 1, sizex = L->flips >> 2 & 1, sizey = L->flips >> 3 & 1;
+    int ry = L->w - 1 - dx, rx = dy;    // the board's (unturned) y and x in the sprite
+    int code = (L->code + gfx_offs[(ry >> 4) ^ (sizey & flipy)][(rx >> 4) ^ (sizex & flipx)]) & 127;
+    *rows = mp_sprite_rows[code];
+    *line = flipy ? 15 - (ry & 15) : ry & 15;
+    *step = flipy ? 1 : -1;
+    *sh = 4 * (flipx ? 15 - (rx & 15) : rx & 15);
+}
+
 // A mansion's line as TMS9918 colours (and the front bit), columns x0 to
 // x1, drawn from the board's tile RAM. The mansion's column U is the
 // tilemap's row 59 - U / 8 (its pixel line 7 - U % 8), its line y the
@@ -300,6 +563,23 @@ static void world_line(int y, int x0, int x1, uint8_t *o) {
         q[6] = c4[(rows[1] >> sh) & 3];
         q[7] = c4[(rows[0] >> sh) & 3];
     }
+    for (int g = 0; g < nlogo; g++) {   // the title's logo, behind the tiles in front of sprites
+        const logo_t *L = &logo[g];
+        if (y < L->y0 || y >= L->y0 + L->h) continue;
+        int a = x0 > L->u0 ? x0 : L->u0, z = x1 < L->u0 + L->w - 1 ? x1 : L->u0 + L->w - 1;
+        for (int u = a; u <= z;) {      // a 16 x 16 at a time: its pen column the same all along
+            int n = 16 - ((u - L->u0) & 15);
+            if (n > z - u + 1) n = z - u + 1;
+            const uint64_t *rows;
+            int sh, line, step;
+            logo_at(L, u - L->u0, y - L->y0, &rows, &sh, &line, &step);
+            const uint8_t *tms = &logo_tms[L->color * 16];
+            for (int k = 0; k < n; k++, u++, line += step) {
+                uint8_t c = tms[(rows[line] >> sh) & 15];
+                if (c && !(o[u] & WP_FRONT)) o[u] = c | WP_LOGO;
+            }
+        }
+    }
 }
 
 // a line's scaled columns k0 to k1 from its pixels: 5 of every 7, the
@@ -329,6 +609,8 @@ static void scale_across(const uint8_t *row, int k0, int k1, uint8_t *o) {
 // drawn and scaled across once, then the group's rows are made from them.
 static uint8_t src_line[WU];
 static uint8_t across[4][WS + 1];
+#define TEXT_ROWS 32                    // the mansion's rows of tiles, 6 lines each scaled
+static int16_t text_lo[TEXT_ROWS], text_hi[TEXT_ROWS];  // the columns scaled again since its text was drawn
 static void rescale(int k0, int r0, int k1, int r1) {
     if (k0 < 0) k0 = 0;
     if (r0 < 0) r0 = 0;
@@ -359,6 +641,10 @@ static void rescale(int k0, int r0, int k1, int r1) {
     if (s0 < PF_X) s0 = PF_X;
     if (s1 > PF_X + PF_W) s1 = PF_X + PF_W;
     if (s0 < s1) mark(s0, r0, s1, r1 + 1);
+    for (int t = r0 / 6; t <= r1 / 6; t++) {    // the text there to draw again
+        if (k0 < text_lo[t]) text_lo[t] = (int16_t)k0;
+        if (k1 > text_hi[t]) text_hi[t] = (int16_t)k1;
+    }
 }
 
 // the scaled column at x 48 for the board's scroll: the screen's middle
@@ -366,6 +652,213 @@ static void rescale(int k0, int r0, int k1, int r1) {
 static int window_of(int scroll) {
     int w = col_of[368 - scroll] - PF_W / 2;
     return w < 0 ? 0 : w > WS - PF_W ? WS - PF_W : w;
+}
+
+// ---- the mansion's text, drawn ----------------------------------------------------------
+// A row's phrase (its text tiles, and the spaces between their words, one
+// or two) is laid out 6 pixels a letter over the columns its tiles' ink
+// scales to, the spaces narrower to make it fit (3 pixels at the least).
+// What it still needs goes into the tiles either side where they're blank
+// in its paper's colour, half and half, so it doesn't cover what's next
+// to it, and not past the view's edges, which are the arcade screen's, so
+// text the arcade shows whole shows whole. Each row keeps the columns its phrases were drawn in, to scale
+// them again first (blank) when it's drawn again.
+#define TEXT_BOXES 8
+static struct { int16_t x0, x1; } text_box[TEXT_ROWS][TEXT_BOXES];
+static uint8_t text_nbox[TEXT_ROWS];
+
+typedef struct { int a, b, spaces, shrink, lead, x0, w; } phrase_t;    // lead: the first letter has ink in its gap
+
+static inline int tile_i(int pr, int tc) { return pr + ((59 - tc) << 5); }
+
+// tile tc of row pr is all one colour, paper (a TMS9918 colour)
+static bool tile_paper(int pr, int tc, uint8_t paper) {
+    if (tc < 0 || tc >= WU / 8) return false;
+    int i = tile_i(pr, tc), code = bd->vram[i];
+    if (is_text[code] || tile_one[code] > 3) return false;
+    return mpcv_tile_tms[(bd->vram[i + 0x800] & 0x3f) * 4 + tile_one[code]] == paper;
+}
+
+static void phrase_layout(int pr, phrase_t *p) {
+    int n = p->b - p->a + 1, first = bd->vram[tile_i(pr, p->a)];
+    p->lead = 0;
+    for (int y = 0; y < 6; y++) p->lead |= glyph6[first][y] & 1;
+    int k0 = col_of[8 * p->a + 1 - p->lead], k1 = col_of[8 * p->b + 7];    // where its ink scales to
+    int w = 6 * n - 1 + p->lead, over = w - (k1 - k0 + 1);
+    p->shrink = 0;
+    if (over > 0 && p->spaces) {
+        p->shrink = over < 3 * p->spaces ? over : 3 * p->spaces;
+        w -= p->shrink;
+        over -= p->shrink;
+    }
+    int left = over / 2;
+    if (over > 0) {
+        uint8_t paper = mpcv_tile_tms[(bd->vram[tile_i(pr, p->a) + 0x800] & 0x3f) * 4];
+        int lroom = tile_paper(pr, p->a - 1, paper) ? k0 - col_of[8 * p->a - 8] : 0;
+        int rroom = tile_paper(pr, p->b + 1, paper) ? col_of[8 * p->b + 15] - k1 : 0;
+        if (lroom > k0 - cur_win) lroom = k0 > cur_win ? k0 - cur_win : 0;
+        if (rroom > cur_win + PF_W - 1 - k1) rroom = cur_win + PF_W - 1 > k1 ? cur_win + PF_W - 1 - k1 : 0;
+        if (over > lroom + rroom) left = lroom + (over - lroom - rroom) / 2;
+        else {
+            if (left > lroom) left = lroom;
+            if (over - left > rroom) left = over - rroom;
+        }
+    }
+    p->x0 = k0 - left;
+    p->w = w;
+}
+
+static void phrase_draw(int pr, const phrase_t *p) {
+    int pos = 0, sp = 0;                // a tile's first column (its letter's gap), from the first's
+    for (int tc = p->a; tc <= p->b; tc++) {
+        int i = tile_i(pr, tc), code = bd->vram[i], attr = bd->vram[i + 0x800];
+        const uint8_t *tms = &mpcv_tile_tms[(attr & 0x3f) * 4], *front = &tile_front[(attr & 0x3f) * 4];
+        const uint8_t fm = (attr & 0x40) ? WP_FRONT : 0;
+        const uint8_t paper = (uint8_t)(tms[0] | (front[0] & fm)), ink = (uint8_t)(tms[1] | (front[1] & fm));
+        int width = 6;
+        if (!is_text[code]) width -= p->shrink / p->spaces + (sp++ < p->shrink % p->spaces);
+        for (int c = 0; c < width; c++) {
+            int x = p->x0 - 1 + p->lead + pos + c;
+            if (x < p->x0 || x >= p->x0 + p->w || x < 0 || x >= WS) continue;
+            for (int y = 0; y < 6; y++) {
+                uint8_t *q = &wpen[6 * pr + y][x], v = is_text[code] && (glyph6[code][y] >> c & 1) ? ink : paper;
+                if (!(*q & WP_LOGO) || (v & WP_FRONT)) *q = v;      // (the logo's sprites in front)
+            }
+        }
+        pos += width;
+    }
+    int s0 = PF_X + p->x0 - cur_win, s1 = s0 + p->w;
+    if (s0 < PF_X) s0 = PF_X;
+    if (s1 > PF_X + PF_W) s1 = PF_X + PF_W;
+    if (s0 < s1) mark(s0, 6 * pr, s1, 6 * pr + 6);
+}
+
+// row pr's text where columns lo..hi were scaled again
+static void text_row(int pr, int lo, int hi) {
+    for (int j = 0; j < text_nbox[pr]; j++) {   // where it was: blank again
+        int x0 = text_box[pr][j].x0, x1 = text_box[pr][j].x1;
+        if (x0 > hi || x1 <= lo) continue;
+        rescale(x0, 6 * pr, x1 - 1, 6 * pr + 5);
+        if (x0 < lo) lo = x0;
+        if (x1 - 1 > hi) hi = x1 - 1;
+    }
+    text_nbox[pr] = 0;
+    const int nt = WU / 8;
+#define CODE(t) bd->vram[tile_i(pr, t)]
+    for (int tc = 0; tc < nt;) {
+        if (!is_text[CODE(tc)]) {
+            tc++;
+            continue;
+        }
+        phrase_t p = {tc, tc, 0, 0, 0, 0, 0};
+        for (int t = tc + 1;;) {
+            while (t < nt && is_text[CODE(t)]) p.b = t++;
+            int s = t;
+            while (s < nt && s - t < 2 && CODE(s) == TEXT_SPACE) s++;
+            if (s == t || s >= nt || !is_text[CODE(s)]) break;
+            p.spaces += s - t;
+            t = s;
+        }
+        phrase_layout(pr, &p);
+        if (p.x0 <= hi && p.x0 + p.w > lo) phrase_draw(pr, &p);
+        int nb = text_nbox[pr];
+        if (nb < TEXT_BOXES) {
+            text_box[pr][nb].x0 = (int16_t)p.x0, text_box[pr][nb].x1 = (int16_t)(p.x0 + p.w);
+            text_nbox[pr]++;
+        } else if (p.x0 + p.w > text_box[pr][nb - 1].x1) {
+            text_box[pr][nb - 1].x1 = (int16_t)(p.x0 + p.w);      // (more than that: the last covers them)
+        }
+        tc = p.b + 1;
+    }
+#undef CODE
+}
+
+static void text_none(void) {
+    for (int t = 0; t < TEXT_ROWS; t++) text_lo[t] = INT16_MAX, text_hi[t] = -1;
+}
+
+static void draw_text(void) {
+    for (int t = 0; t < TEXT_ROWS; t++) {
+        if (text_lo[t] > text_hi[t]) continue;
+        text_row(t, text_lo[t], text_hi[t]);
+        text_lo[t] = INT16_MAX, text_hi[t] = -1;
+    }
+}
+
+// ---- the title's logo, found ---------------------------------------------------------------
+// the logo's sprites now; where they were and are, scaled again. Its
+// sprites make one block, which moves as a whole while the mansion
+// scrolls under it, so the box around all of them is scaled, once for
+// where it was and where it is when those meet.
+typedef struct { int u0, y0, u1, y1; } box_t;   // first and last columns and lines (logo_dirty: scaled)
+static box_t logo_box(const logo_t *L, int n) {
+    box_t b = {WU, PL, -1, -1};
+    for (int g = 0; g < n; g++) {
+        if (L[g].u0 < b.u0) b.u0 = L[g].u0;
+        if (L[g].y0 < b.y0) b.y0 = L[g].y0;
+        if (L[g].u0 + L[g].w - 1 > b.u1) b.u1 = L[g].u0 + L[g].w - 1;
+        if (L[g].y0 + L[g].h - 1 > b.y1) b.y1 = L[g].y0 + L[g].h - 1;
+    }
+    return b;
+}
+
+static box_t logo_dirty[2];             // to scale again (logo_redraw), after the tiles
+static int nlogo_dirty;
+
+static void logo_rescale(box_t b) {
+    int u0 = b.u0 - 1, u1 = b.u1 + 1, y0 = b.y0 - 1, y1 = b.y1 + 1;    // (and the pixels next to it)
+    if (u0 < 0) u0 = 0;
+    if (u1 > WU - 1) u1 = WU - 1;
+    if (y0 < 0) y0 = 0;
+    if (y1 > PL - 1) y1 = PL - 1;
+    if (u0 > u1 || y0 > y1) return;
+    logo_dirty[nlogo_dirty++] = (box_t){col_of[u0], row_of[y0], col_of[u1], row_of[y1]};
+}
+
+// the boxes logo_find left, scaled again where the scaled columns are kept
+// (range_lo to range_hi; the rest is scaled when it comes into view)
+static void logo_redraw(void) {
+    for (int i = 0; i < nlogo_dirty; i++) {
+        box_t b = logo_dirty[i];
+        rescale(b.u0 > range_lo ? b.u0 : range_lo, b.y0, b.u1 < range_hi ? b.u1 : range_hi, b.y1);
+    }
+    nlogo_dirty = 0;
+}
+
+static void logo_find(void) {
+    nlogo_dirty = 0;
+    memcpy(logo_was, logo, sizeof logo);
+    nlogo_was = nlogo;
+    nlogo = 0;
+    memset(logo, 0, sizeof logo);
+    const uint8_t *s1 = bd->spr[0], *s2 = bd->spr[1], *s3 = bd->spr[2];
+    int off = 256 - bd->scroll;
+    for (int offs = 0; offs < 0x80 && nlogo < NLOGO; offs += 2) {
+        if ((s3[offs + 1] & 2) || (s1[offs] & 127) < LOGO_CODE) continue;
+        int sx = s2[offs + 1] + 0x100 * (s3[offs + 1] & 1) - 40;
+        int sy = 256 - s2[offs] + 1;
+        int sizex = (s3[offs] >> 2) & 1, sizey = (s3[offs] >> 3) & 1;
+        sy -= 16 * sizey;
+        sy = (sy & 0xff) - 32;
+        logo_t *L = &logo[nlogo++];
+        L->w = (uint8_t)(16 * (sizey + 1));
+        L->h = (uint8_t)(16 * (sizex + 1));
+        L->u0 = (int16_t)(224 - sy - L->w + off);
+        L->y0 = (int16_t)(sx - 16);
+        L->code = (uint8_t)((s1[offs] & 127) & ~sizex & ~(sizey << 1));
+        L->color = s1[offs + 1] & 15;
+        L->flips = s3[offs] & 15;
+    }
+    if (nlogo == nlogo_was && !memcmp(logo, logo_was, sizeof logo)) return;
+    box_t was = logo_box(logo_was, nlogo_was), is = logo_box(logo, nlogo);
+    if (nlogo_was && nlogo && was.u0 <= is.u1 + 1 && is.u0 <= was.u1 + 1 && was.y0 <= is.y1 + 1 && is.y0 <= was.y1 + 1) {
+        box_t both = {was.u0 < is.u0 ? was.u0 : is.u0, was.y0 < is.y0 ? was.y0 : is.y0,
+                      was.u1 > is.u1 ? was.u1 : is.u1, was.y1 > is.y1 ? was.y1 : is.y1};
+        logo_rescale(both);
+    } else {
+        if (nlogo_was) logo_rescale(was);
+        if (nlogo) logo_rescale(is);
+    }
 }
 
 // ---- the margins' pieces -------------------------------------------------------------
@@ -522,20 +1015,12 @@ static const simg_t *sprite_image(int code, int color, bool flipx, bool flipy) {
             img[v][u] = mpcv_spr_tms[color * 16 + pen];
         }
     }
+    unsigned mc = spr_merge[code][0], ml = spr_merge[code][1];  // (the sprites' numbers and letters)
+    if (flipy) mc = mirror16(mc);
+    if (flipx) ml = mirror16(ml);
     uint8_t h[16][12];                  // the columns first
-    for (int v = 0; v < 16; v++)
-        for (int g = 0; g < 4; g++) {
-            const uint8_t *p = &img[v][4 * g];
-            h[v][3 * g] = p[0];
-            h[v][3 * g + 1] = cvscale_pick(p[1], p[2], p[0], p[3]);
-            h[v][3 * g + 2] = p[3];
-        }
-    for (int g = 0; g < 4; g++) {
-        memcpy(s->px[3 * g], h[4 * g], 12);
-        for (int x = 0; x < 12; x++)
-            s->px[3 * g + 1][x] = cvscale_pick(h[4 * g + 1][x], h[4 * g + 2][x], h[4 * g][x], h[4 * g + 3][x]);
-        memcpy(s->px[3 * g + 2], h[4 * g + 3], 12);
-    }
+    for (int v = 0; v < 16; v++) squeeze16(img[v], 1, mc, h[v], 1);
+    for (int x = 0; x < 12; x++) squeeze16(&h[0][x], 12, ml, &s->px[0][x], 12);
     s->key = key;
     return s;
 }
@@ -552,7 +1037,7 @@ static void find_sprites(void) {
     static const uint8_t gfx_offs[2][2] = {{0, 1}, {2, 3}};
     int off = 256 - bd->scroll;         // the mansion's column at the screen's X 0
     for (int offs = 0; offs < 0x80; offs += 2) {
-        if (s3[offs + 1] & 2) continue;
+        if ((s3[offs + 1] & 2) || (s1[offs] & 127) >= LOGO_CODE) continue;     // (the logo: in the mansion)
         int sprite = s1[offs], color = s1[offs + 1] & 15;
         int sx = s2[offs + 1] + 0x100 * (s3[offs + 1] & 1) - 40;
         int sy = 256 - s2[offs] + 1;
@@ -649,6 +1134,32 @@ static inline __attribute__((always_inline)) void span(mpcv_t *e, unsigned a, co
     e->want_col[a] = (uint8_t)(fg << 4 | bg);
 }
 
+// 8 pixels with some of the title's logo, more than two colours: the
+// letters' (the most used) kept first, then black, then the shadow's
+// grey. The black is where the letters' outline was, between a letter and
+// its shadow, so a letter keeps its edge and the shadow gives way to it,
+// as it goes behind the arcade's letters.
+static void span_logo(mpcv_t *e, unsigned a, uint8_t *c) {
+    uint8_t cnt[16] = {0};
+    int n = 0;
+    for (int i = 0; i < 8; i++) n += !cnt[c[i] & 15]++;
+    if (n > 2) {
+        uint8_t a1 = 0, a2 = 0;
+        int r1 = -1, r2 = -1;
+        for (int k = 1; k < 16; k++) {
+            if (!cnt[k]) continue;
+            int r = k == GREY ? cnt[k] : k == BLACK ? 32 + cnt[k] : 64 + cnt[k];
+            if (r > r1) a2 = a1, r2 = r1, a1 = (uint8_t)k, r1 = r;
+            else if (r > r2) a2 = (uint8_t)k, r2 = r;
+        }
+        bool black = a1 == BLACK || a2 == BLACK, grey = a1 == GREY || a2 == GREY;
+        for (int i = 0; i < 8; i++)
+            if (c[i] != a1 && c[i] != a2)
+                c[i] = c[i] == GREY && black ? BLACK : c[i] == BLACK && grey ? GREY : NEARER(c[i], a1, a2) ? a1 : a2;
+    }
+    span(e, a, c);
+}
+
 // ---- making the places -------------------------------------------------------------------
 // the sprites over a place (8 x 8 at cell cx, band b), as TMS9918 colours
 // (0: none), in o; false if none is there
@@ -678,6 +1189,7 @@ MPCV_HOT static void make_cell(mpcv_t *e, int b, int cx, const uint8_t (*o)[8]) 
     bool play = cx >= PF_X / 8 && cx < (PF_X + PF_W) / 8;
     for (int k = 0; k < 8; k++) {
         int y = b * 8 + k;
+        bool logo_here = false;
         if (!play) {
             memcpy(c, &margin[y][MX(cx * 8)], 8);
         } else {
@@ -685,11 +1197,12 @@ MPCV_HOT static void make_cell(mpcv_t *e, int b, int cx, const uint8_t (*o)[8]) 
             uint32_t w0, w1;
             memcpy(&w0, p, 4);
             memcpy(&w1, p + 4, 4);
+            logo_here = ((w0 | w1) & 0x40404040u) != 0;
             if (o && ((w0 | w1) & 0x80808080u))     // the sprites, but behind the tiles in front of them
-                for (int i = 0; i < 8; i++) c[i] = (o[k][i] && !(p[i] & 0x80)) ? o[k][i] : p[i] & 0x7f;
+                for (int i = 0; i < 8; i++) c[i] = (o[k][i] && !(p[i] & WP_FRONT)) ? o[k][i] : p[i] & WP_COLOR;
             else {
-                w0 &= 0x7f7f7f7fu;
-                w1 &= 0x7f7f7f7fu;
+                w0 &= 0x0f0f0f0fu;
+                w1 &= 0x0f0f0f0fu;
                 memcpy(c, &w0, 4);
                 memcpy(c + 4, &w1, 4);
                 if (o)
@@ -697,7 +1210,8 @@ MPCV_HOT static void make_cell(mpcv_t *e, int b, int cx, const uint8_t (*o)[8]) 
                         if (o[k][i]) c[i] = o[k][i];
             }
         }
-        span(e, (unsigned)(b * 256 + cx * 8 + k), c);
+        if (logo_here) span_logo(e, (unsigned)(b * 256 + cx * 8 + k), c);
+        else span(e, (unsigned)(b * 256 + cx * 8 + k), c);
     }
     e->stats.cells += 8;
 }
@@ -777,11 +1291,16 @@ MPCV_HOT void mpcv_picture(mpcv_t *e, const mpcv_board_t *b) {
         memset(&pic_u, 0, sizeof pic_u.p);
         memset(ov_hash, 0xff, sizeof ov_hash);
         range_lo = 1, range_hi = 0;
+        memset(text_nbox, 0, sizeof text_nbox);
+        text_none();
+        nlogo = 0;
+        memset(logo, 0, sizeof logo);
         pic_clear = true;
         e->pic_valid = false;
     }
     int win = window_of(b->scroll);
     cur_win = win;
+    logo_find();
     bool all = !e->pic_valid;
     if (all) {
         memset(margin, BLACK, sizeof margin);
@@ -816,6 +1335,7 @@ MPCV_HOT void mpcv_picture(mpcv_t *e, const mpcv_board_t *b) {
     if (all || nchanged > 160) {
         range_lo = 1, range_hi = 0;
         e->stats.tiles += (uint32_t)nchanged;
+        nlogo_dirty = 0;                // (the logo too, below)
     } else {
         for (int k = 0; k < nchanged; k++) {
             int i = changed[k], tc = 59 - (i >> 5), pr = i & 31;
@@ -828,7 +1348,9 @@ MPCV_HOT void mpcv_picture(mpcv_t *e, const mpcv_board_t *b) {
             rescale(k0, row_of[y0 ? y0 - 1 : 0], k1, row_of[y0 + 8 < PL ? y0 + 8 : PL - 1]);
         }
     }
+    logo_redraw();
     keep_range(lo, hi);
+    draw_text();
     if (win != e->win) {
         e->win = (int16_t)win;
         mark_play();
@@ -884,8 +1406,8 @@ void mpcv_ideal(const mpcv_t *e, uint8_t *px) {
                     int y = b * 8 + k, x = cx * 8 + i;
                     bool play = x >= PF_X && x < PF_X + PF_W;
                     uint8_t w = play ? wpen[y][e->win + x - PF_X] : 0;
-                    uint8_t c = !play ? margin[y][MX(x)] : w & 0x7f;
-                    if (over && o[k][i] && !(play && (w & 0x80))) c = o[k][i];
+                    uint8_t c = !play ? margin[y][MX(x)] : w & WP_COLOR;
+                    if (over && o[k][i] && !(play && (w & WP_FRONT))) c = o[k][i];
                     px[y * MPCV_W + x] = c ? c : BLACK;
                 }
         }

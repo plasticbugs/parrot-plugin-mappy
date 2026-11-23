@@ -51,6 +51,6 @@ cvcart_features(mappy PADS CARD)
 
 # The plugin (docs/plugin-rules.md): the ID is yours for good; the version
 # is the release's tag without its v.
-cvcart_plugin(mappy ID parrotcart.mappy NAME "Mappy" VERSION 0.1.0 BY "Parrot Cart"
+cvcart_plugin(mappy ID parrotcart.mappy NAME "Mappy" VERSION 0.1.1 BY "Parrot Cart"
               ICON src/icon.txt README README.md FILE MAPPY.CVP
               HOME /MAPPY USES usb-host)

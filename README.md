@@ -30,6 +30,8 @@ On a USB pad, through a powered hub:
 
 The arcade screen is taller than the TV's, so the mansion is scaled down to fit in the middle. It's scaled as a whole, not as the screen shows it, so the floors and doors keep their shape while the screen scrolls. Mappy and the cats are scaled one at a time and keep their shape too. While the mansion scrolls, the whole picture changes, so the console shows fewer new pictures a second and can show parts of two at once.
 
+Text in the mansion is drawn 6 pixels a letter, so every letter keeps its strokes, and the points keep theirs too. The MAPPY logo on the title screen is scaled with the mansion. The ColecoVision can show only two colours in each 8-pixel run, so the logo drops its dark blue outline and keeps the letters' colours first.
+
 The scores, lives, rounds and credits go in the margins on both sides at the arcade's size, so every letter stays readable.
 
 The board's sound chip has eight voices. They're mixed as in MAME and played as samples on the ColecoVision's sound chip, at about the loudness of an ordinary cartridge.

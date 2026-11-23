@@ -8,7 +8,11 @@ MAME shows Mappy turned on its side, 224 pixels wide and 288 high. The middle 25
 
 The mansion is scaled as a whole, 5 columns of every 7 and 3 lines of every 4, from 480 by 256 to 343 by 192. The console shows 160 columns of it, from x 48 to 207, and moves that window as the arcade scrolls. Because the 7s and 4s belong to the mansion and not to the screen, a floor, a door or a trampoline looks the same wherever it is on the screen. Two columns or lines become one the way `sdk/cvscale.h` does it, so a stroke one pixel wide still shows. Only the tiles that change are scaled again.
 
-Mappy, the cats and the items are scaled one at a time, from 16 by 16 to 12 by 12, so they keep their shape as they move. Each goes where the mansion's scaling puts its middle.
+Mappy, the cats and the items are scaled one at a time, from 16 by 16 to 12 by 12, so they keep their shape as they move. Each goes where the mansion's scaling puts its middle. One pair of pixels in each 4 is made one, the middle pair for most sprites. The points (100 to 500, x2 to x6), the bonus round's numbers and GAME OVER are sprites too, and with the middle pairs "200" read "2oo". So each sprite of one or two colours gets its own pair in each 4, the one that keeps the most strokes and gaps. All the points keep every one.
+
+The MAPPY logo on the title screen is 11 sprites, letters with a dark blue outline over a grey shadow. Those sprites go into the mansion before it's scaled, so they're on the tiles' grid, as the arcade's whole picture scaled would be. The TMS9918 has two colours in each 8 pixels of a line, too few for a letter, its outline, the shadow and black at once, and choosing the two most used broke the letters up. So the outline is left out, and where 8 pixels still have more than two colours, the letters' colour is kept first, then black, then the grey. The black is where the outline was, so each letter keeps its edge and the shadow gives way to it. While the mansion scrolls under the logo, the box around it is scaled again once a picture.
+
+Text in the mansion isn't scaled with it. Scaled 5 of 7, a letter loses two of its 8 columns wherever the grid falls, and "2ND" read "RND". Each text tile is drawn 6 by 6 instead: two pairs of its columns and two pairs of its lines made one, the pairs chosen for each letter so that every row and column keeps its strokes and gaps and the fewest pixels are lost. A line's words and the spaces between them are laid out 6 pixels a letter over the width their tiles scale to. The spaces get narrower to make it fit, and anything left over goes into blank tiles either side, but not past the edge of the view, so text the arcade shows whole shows whole. `textcheck.c` checks all 57 text tiles the game uses: the letters, both sets of digits, `/`, `!`, `?` and `.`. The copyright sign fills its 8 by 8, so no two pairs keep it, and it's drawn 6 by 6 instead.
 
 The rows above and below go in the 48-pixel margins at the arcade's size, so every letter keeps its shape:
 
@@ -33,7 +37,7 @@ Each list runs the board for its own time, 16.83 ms, so the game keeps the arcad
 
 Both CPUs spend most of their time in a two-instruction loop, waiting for their interrupt. `src/mp.c` skips whole turns of those loops at once. Nothing else can run inside a CPU's timeslice, so this changes nothing the other CPU, the sound chip or the picture can see, and the tests against MAME still match at every frame.
 
-At 150 MHz a list takes the cart 5.1 ms of its 16.8 ms on average and 13.4 ms at the 99th percentile, by `armcount.sh` over 3,051 lists of the attract mode and a game. The worst, 21.9 ms, is a list where the whole mansion is scaled again. The cart is a list ahead by then, so it still isn't late, and no list was late in the count. Without the wait-loop skip and the faster scaler, the average was 10.6 ms and 8 lists were late.
+At 150 MHz a list takes the cart 5.2 ms of its 16.8 ms on average and 13.9 ms at the 99th percentile, by `armcount.sh` over 3,051 lists of the attract mode and a game. The worst, 22.8 ms, is a list just after the coin, where the whole mansion is scaled again while the title's logo moves. The cart is a list ahead by then, so it still isn't late, and no list was late in the count. Without the wait-loop skip and the faster scaler, the average was 10.6 ms and 8 lists were late.
 
 ## The tests
 
@@ -41,6 +45,7 @@ At 150 MHz a list takes the cart 5.1 ms of its 16.8 ms on average and 13.4 ms at
 - `compare.sh attract` and `compare.sh game` check the board against MAME frame by frame. `mp_host.c` is the board on the computer, `mpdump.lua` records MAME's frames, and `cmpdump.py` compares them. In a game, `bot.h` plays and MAME plays back what it pressed.
 - `cart_host.c` runs the cart's side on the computer: the board a list at a time, the pictures and the lists. It makes the previews, MAME's picture beside the console's.
 - `hudcheck.c` checks which columns a 7-digit score can lose.
+- `textcheck.c` checks every text tile's letter as the mansion shows it, and prints the points and the other one- and two-colour sprites as the console shows them.
 - `armcount.sh` times the plugin's code on an Arm model at 150 MHz.
 
 They need MAME's `mappy.zip` (`MP_ROMS`). MAME runs headless. Neither the ROMs nor anything made from them goes in this repository: the tests write under `$TMPDIR`.

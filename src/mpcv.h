@@ -144,3 +144,13 @@ float mpcv_dac_level(int att0, int att1, int att2);
 extern const uint32_t mpcv_tms_rgb[16];
 // the board's pens as TMS9918 colours (tests): a tile's (0-255), a sprite's (0-255, 0 see-through)
 extern uint8_t mpcv_tile_tms[256], mpcv_spr_tms[256];
+// a text tile's letter as the mansion shows it, 6 x 6 (bit x of row y),
+// and the pairs of its columns and of its lines made one (bit j: j and
+// j + 1; none: drawn, the copyright sign); false for a tile that isn't
+// text (tests: test/mp/textcheck.c)
+bool mpcv_text_glyph(int code, uint8_t rows[6], uint8_t *cols, uint8_t *lines);
+
+// the pairs of a sprite's columns and of its lines made one, unflipped
+// (bit j: j and j + 1); its own for a sprite of one or two pens, the
+// points and the like, else 0x2222 (tests: test/mp/textcheck.c)
+bool mpcv_spr_glyph(int code, uint16_t *cols, uint16_t *lines);

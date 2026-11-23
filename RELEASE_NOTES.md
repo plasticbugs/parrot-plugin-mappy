@@ -1,1 +1,4 @@
-The first release. Mappy runs from your own copy of MAME's mappy set.
+- Text in the mansion keeps every letter's shape. "2ND" no longer reads "RND", and "1983" no longer reads "1985".
+- The points keep their shape too. "200" no longer reads "2oo".
+- The MAPPY logo on the title screen lines up with its shadow and reads as the arcade's logo.
+- A new menu icon.
