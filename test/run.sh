@@ -170,16 +170,47 @@ b2b_fails() {
 }
 
 # ---- the plugin in src/ (tools/new-plugin.py rewrites this part) ----
-# Each run fails on any rule the models see (test/host/host.c). After a
-# run's folder, add what your plugin's log must show, as grep -E patterns:
-# its note ('note "Saved"'), PSG bytes ('psg 9F'), MIDI ('midi 90 3C').
+# Mappy plays from the user's ROMs on the card: MP_ROMS names MAME's
+# mappy.zip (never in the repository). Without it, only the card with no
+# ROMs is tried; the plugin has to say they're missing. Its lists run back
+# to back (CMakeLists.txt: parrotcart_frames(mappy BACK_TO_BACK)), and the
+# models check them that way.
+mp_card() {                             # mp_card NAME [ZIP]: $out/card-NAME.cdr, /MAPPY holding ZIP
+    tree=$out/tree-$1
+    rm -rf "$tree" "$out/card-$1.cdr"
+    mkdir -p "$tree/MAPPY" "$tree/PLUGINS"
+    [ -n "$2" ] && cp "$2" "$tree/MAPPY/mappy.zip"
+    printf 'not a ROM\n' > "$tree/MAPPY/readme.txt"
+    "$kit/tools/mkcard.sh" "$tree" "$out/card-$1.cdr" exfat mbr >/dev/null
+    rm -rf "$tree"
+}
+if wanted mappy-noroms; then
+    mp_card noroms
+    PC_END=1500 PC_CARD=$out/card-noroms.cdr \
+        run mappy-noroms "$kit/src" 'note "Mappy: 11 ROMs missing"' 'back to the menu' \
+            'psg 80 00 9F A0 00 BF C0 00 DF FF'
+fi
 if wanted mappy; then
-    PC_END=3000 PC_SCRIPT="500:joy=up+fire 900:joy= 1200:key=5 1500:key= 2000:joy=fire2 2300:joy=" \
-        run mappy "$kit/src" 'back to the menu'
+    if [ -n "$MP_ROMS" ]; then
+        mp_card roms "$MP_ROMS"
+        PC_END=40000 PC_CARD=$out/card-roms.cdr \
+        PC_SCRIPT="17000:key=* 17150:key= 18000:key=1 18150:key= 19000:joy=right 21000:joy=left+fire 21200:joy=left 24000:joy=right 27000:joy=" \
+            run mappy "$kit/src" 'note "MP [0-9]+/s' 'back to the menu, its bottom line "MP' 'psg .*E4 FF'
+        rm -f "$out/card-roms.cdr"
+    else
+        echo "mappy"; echo "  (MP_ROMS isn't set: MAME's mappy.zip, for the game)"
+    fi
 fi
 if wanted mappy-usb; then
-    PC_END=4000 PC_SCRIPT="2000:pad=south+l 2100:lstick=1500,-900 2200:rstick=-2048,2047 2400:pad=east+up 3800:snap=usb" \
-        run mappy-usb "$kit/src" 'usb: the port is a host' 'back to the menu'
+    if [ -n "$MP_ROMS" ]; then
+        mp_card usb "$MP_ROMS"
+        PC_END=30000 PC_CARD=$out/card-usb.cdr \
+        PC_SCRIPT="1000:pad=up 17000:pad=minus 17150:pad=up 18000:pad=plus 18150:pad=up 19000:pad=right 21000:pad=south 21200:lstick=-1800,0 24000:pad=east 29000:snap=usb" \
+            run mappy-usb "$kit/src" 'usb: the port is a host' 'back to the menu, its bottom line "MP'
+        rm -f "$out/card-usb.cdr"
+    else
+        echo "mappy-usb"; echo "  (MP_ROMS isn't set: MAME's mappy.zip, for the game)"
+    fi
 fi
 # ---- the examples ----
 # (left out with examples/: tools/new-plugin.py --examples keeps them)

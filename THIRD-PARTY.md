@@ -31,6 +31,33 @@ also contains Lua (MIT).
 
 The 8x8 screen font's letter shapes come from the 1982 arcade game Mr. Do!
 
+## MAME
+
+The code in `src/` was written for this plugin. Parts of it are ports of
+MAME's code, or were written with MAME's code as the reference. That code
+is under the BSD 3-Clause license (`LICENSE`). It comes from MAME
+(<https://github.com/mamedev/mame>, tag `mame0288`), and its copyright
+holders are listed here.
+
+| Here | From MAME | Copyright holders |
+|---|---|---|
+| `src/mp.c`, `src/mp.h`: the memory maps, the inputs and DIP switches, the interrupts, the palette, the tiles and the sprites | `src/mame/namco/mappy.cpp`, `mappy_v.cpp` | Nicola Salmoria |
+| `src/mp.c`: the two 58XX I/O chips | `src/mame/namco/namcoio.cpp` | Nicola Salmoria |
+| `src/mp.c`: the LS259 latch and the LS157 multiplexer | `src/devices/machine/74259.cpp`, `74157.cpp` | AJR |
+| `src/mp.c`: the palette's resistor weights | `src/emu/video/resnet.cpp` | Couriersud |
+| `src/mp.c`: the screen's timers, the watchdog and the sound manager's update timer | `src/emu/screen.cpp`, `src/devices/machine/watchdog.cpp`, `src/emu/sound.cpp` | Aaron Giles |
+| `src/mpsnd.c`, `src/mpsnd.h`: the 15XX sound chip | `src/devices/sound/namco.cpp` | Nicola Salmoria, Aaron Giles |
+| `src/mproms.c`: the ROMs' names, sizes and CRC-32s | `src/mame/namco/mappy.cpp` | Nicola Salmoria |
+| `test/mp/mpdump.lua`: the tests' recorder | written for this plugin, against MAME's Lua interface | |
+
+The two 6809s are `lib/m6809/` and the scheduler `lib/sched/` (above).
+
+`src/mpcv.c`, `src/mprun.c`, `src/mpcard.c` and the sample code follow
+the cart's Time Pilot plugin, by Parrot Cart.
+
+Mappy is a trademark of Bandai Namco. The game is Namco's, 1983. This
+plugin contains none of the game.
+
 ## The plugin template's license
 
 ```

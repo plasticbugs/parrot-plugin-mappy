@@ -1,286 +1,272 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Parrot Cart
 //
-// Mappy: Namco's 1983 arcade game Mappy on the ColecoVision, run from your own
-// MAME ROMs.
+// Mappy -- Namco's 1983 arcade game on the ColecoVision: the cart runs the
+// arcade board (mp.c and mpsnd.c, MAME 0.288's emulation: the two 6809s,
+// the two 58XX I/O chips and the 15XX sound chip) from the user's ROMs on
+// the card, and mpcv.c sends the picture and the sound to the console as
+// the frame kernel's lists. RESET goes back to the menu. (Time Pilot's
+// main.c, from Donkey Kong's.)
 //
-// Made by tools/new-plugin.py, with USB game pads. It builds and runs as it
-// is, with each feature on the TV, working. YOUR CODE marks where yours goes;
-// take out what you don't want to show. docs/features.md has the features,
-// sdk/firmware/revc/sdk/README.md the SDK.
+//   core 1  serves the kernel and a list a TV frame (cvframes.c)
+//   core 0  this loop: a list at a time (mprun.c), the board run for the
+//           list's time, the changes to the picture of its last VBLANK and
+//           the list's samples, handed to core 1 as soon as it will take it
 //
-// How a plugin runs. The cart has two cores:
+// The console runs the lists back to back (their sound is a sample
+// stream), and each list runs the board for just the list's time (16.77
+// ms), so the game keeps the arcade's speed. A list that isn't ready when
+// the console wants it makes the console run the last one again (its sound
+// once more) and puts the game a list behind. The note counts those.
 //
-//   core 1  is the cartridge: it answers every read the console makes,
-//           from a small Z80 program (the SDK's frame kernel) that runs one
-//           list of video and sound writes every TV frame and reports the
-//           controller. cvf_start() starts it; you never touch it again.
-//   core 0  is this file: one loop that never waits for long.
-#include <stdarg.h>
+// The ROMs (MAME's "mappy" set) are read from the card's /MAPPY folder,
+// loose or zipped, or from /MAPPY.ZIP, each known by its size and CRC-32.
+//
+// Controls (the kit's arcade keys): the stick, or a USB pad's d-pad or left
+// stick, runs left and right; either fire button or any face button opens
+// a door; keypad * or #, or -, is a coin; keypad 1 or + starts one player,
+// keypad 2 two.
 #include <stdio.h>
 #include <string.h>
 
 #include "pico/stdlib.h"
+#if __has_include("hardware/watchdog.h")
+#include "hardware/watchdog.h"
+#else                                   // (the kit's model of the console, test/host: no watchdog)
+static inline void watchdog_enable(uint32_t ms, bool pause) { (void)ms; (void)pause; }
+static inline void watchdog_update(void) {}
+#endif
 
-#include "cvdiag.h"             // a crash becomes a note on the menu's bottom line
-#include "cvframes.h"           // the console: cvf_*
-#include "font8.h"              // the menu's 8x8 font, ASCII 32-95
-#include "gbkernel.h"           // made by the build: the frame kernel
-#include "handoff.h"            // made by the build: the ROM that parks the console between firmwares
-#include "cvinput.h"            // player 1: the console's controller and USB pad 1
-#include "cvusb.h"              // the USB port: pads
+#include "cvdiag.h"
+#include "cvframes.h"
+#include "cvinput.h"
+#include "cvsd.h"
+#include "cvusb.h"
+#include "gbkernel.h"
+#include "handoff.h"
+#include "vdp.h"
+#include "mp.h"
+#include "mpcard.h"
+#include "mpcv.h"
+#include "mprun.h"
+#include "mpsnd.h"
 
-#define NAME "Mappy"
-#define BY   "Parrot Cart"
+#define OPEN_US     20000           // serve the console this long before the card's (blocking) start
+#define WATCHDOG_MS 4000            // a hang reboots into the menu
+#define NOTE_US     1000000         // the menu's note is brought up to date this often
+#define GAME        "Mappy"         // in the menu's notes
+#define TAG         "MP"
 
-// ---- the screen: 24 rows of 28 characters -------------------------------------------------
-// Each thing shown has its row. say() fills a row; picture() shows the rows.
-// The font has capitals, digits and ! # & ' ( ) * + , - . / : ? _ (the rest
-// show as ?).
-enum {
-    ROW_TITLE = 1, ROW_BY = 2, ROW_STICK = 4, ROW_KEYPAD = 5, ROW_USB = 7, ROW_PAD = 9,
-    ROW_RESET = 22,
-};
-#define ROWS 24
-#define COLS 28                 // (the TV cuts the edges: 2 characters each side are left off)
-static char text[ROWS][COLS + 1];
-// (this picture is in one color; these are the console's numbers for them)
-enum { C_BLACK = 1, C_LGREEN = 3, C_LRED = 9, C_LYELLOW = 11, C_GRAY = 14, C_WHITE = 15 };
+static mpcv_t enc;
+static mprun_t run;
+static mp_roms_t roms;
+static uint8_t list[MPCV_LIST_MAX];
+static size_t list_len;
+static bool list_pending;                   // built, not published yet
+static uint32_t seen_frames;
+static uint8_t *scratch;                    // mpcv's room before the game: a message's canvas, the card's reads
+static size_t scratch_n;
 
-static void __attribute__((format(printf, 3, 4))) say(int row, uint8_t color, const char *fmt, ...) {
-    char s[64];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(s, sizeof s, fmt, ap);
-    va_end(ap);
-    int i = 0;
-    for (; i < COLS && s[i]; i++) text[row][i] = s[i] >= 'a' && s[i] <= 'z' ? (char)(s[i] - 32) : s[i];   // the font is upper case
-    text[row][i] = 0;
-    (void)color;
+#define CANVAS      (*(canvas_t *)(void *)scratch)
+
+// ---- the console ---------------------------------------------------------------------
+static void tasks(void) {
+    cvusb_task();
+    cvf_task(time_us_32());
+    watchdog_update();
 }
 
-static void leave_note(const char *s) {
-    cvf_note(s);                // the menu's bottom line when RESET takes the console back (32 characters at most)
+static void publish(void) {
+    if (list_pending && cvf_publish(list, list_len)) list_pending = false;
 }
 
-// ---- player 1 ---------------------------------------------------------------------------
-static cvin_t in;
-static unsigned presses;
-
-static void player_step(void) {
-    cvin_update(&in);
-    const uint8_t pressed = cvin_pressed(&in);
-    const int key = cvin_key(&in);
-    // YOUR CODE: player 1. in.held (CVIN_UP, CVIN_FIRE_L ...) and in.key
-    // (0-9, CVIN_STAR, CVIN_HASH, -1) are what is down now; pressed and key
-    // what went down since the last step.
-    if (pressed || key >= 0) {
-        presses++;
-        static char note[33];
-        snprintf(note, sizeof note, "Mappy: %u presses", presses);
-        leave_note(note);
-    }
-    const uint8_t h = in.held;
-    say(ROW_STICK, C_WHITE, "STICK %s%s%s%s FIRE %s%s", h & CVIN_UP ? "UP " : "", h & CVIN_DOWN ? "DOWN " : "",
-        h & CVIN_LEFT ? "LEFT " : "", h & CVIN_RIGHT ? "RIGHT " : "", h & CVIN_FIRE_L ? "L " : "", h & CVIN_FIRE_R ? "R" : "");
-    const char k = in.key < 0 ? '-' : in.key == CVIN_STAR ? '*' : in.key == CVIN_HASH ? '#' : (char)('0' + in.key);
-    say(ROW_KEYPAD, C_WHITE, "KEYPAD %c  PRESSES %u", k, presses);
+// TV frames the console has started since the last call (0: none yet, or
+// the last list isn't out): for the messages' lists, a TV frame each
+static uint32_t new_frames(void) {
+    tasks();
+    publish();
+    if (list_pending) return 0;
+    uint32_t f = cvf_frames(), n = f - seen_frames;
+    seen_frames = f;
+    return n;
 }
 
-// ---- the USB port -----------------------------------------------------------------------
-static void usb_step(void) {
-    const cvusb_mode_t mode = cvusb_mode();
-    say(ROW_USB, mode == CVUSB_HOST || mode == CVUSB_DEVICE ? C_WHITE : C_LYELLOW, "USB %s", cvusb_mode_name(mode));
+static void send(void) {
+    list_len = mpcv_tv_frame(&enc, list);
+    list_pending = true;
+    publish();
 }
 
-// ---- USB game pads ----------------------------------------------------------------------
-// Buttons by where they are: S the bottom face button (B on a Nintendo pad),
-// E the right one, W the left, N the top.
-static const char *const BUTTON[GP_BUTTONS] = {"UP", "DN", "LT", "RT", "S", "E", "W", "N", "L", "R",
-                                               "ZL", "ZR", "-", "+", "HOME", "CAP", "L3", "R3"};
+// ---- messages ------------------------------------------------------------------------
+static void center(int y, const char *s, uint8_t color, int scale) {
+    int w = (int)strlen(s) * 8 * scale;
+    canvas_text(&CANVAS, w < VDP_W ? (VDP_W - w) / 2 : 0, y, s, color, scale);
+}
 
-static void pads_step(void) {
-    for (int n = 0; n < CVUSB_PAD_MAX; n++) {
-        const int row = ROW_PAD + 3 * n;
-        const char *kind = cvusb_pad_kind(n);
-        gamepad_t p;
-        if (!cvusb_pad(n, &p)) {
-            say(row, C_GRAY, "PAD %d %s", n + 1, kind ? "STARTING" : "-");
-            say(row + 1, C_GRAY, "%s", "");
-            say(row + 2, C_GRAY, "%s", "");
-            continue;
-        }
-        // YOUR CODE: pad n. p.buttons: the GP_* held (gamepad.h); p.lx, p.ly,
-        // p.rx, p.ry: the sticks, -2048..2047, y up. Pad 1 is player 1 too.
-        char b[64] = "";
-        size_t at = 0;
-        for (int i = 0; i < GP_BUTTONS; i++)
-            if (p.buttons & 1u << i) at += (size_t)snprintf(b + at, sizeof b - at, "%s ", BUTTON[i]);
-        say(row, C_WHITE, "PAD %d %s", n + 1, kind ? kind : "");
-        say(row + 1, C_WHITE, "  %s", at ? b : "-");
-        say(row + 2, C_WHITE, "  L%+5d%+5d R%+5d%+5d", p.lx, p.ly, p.rx, p.ry);
+static void message(const char *head, const char *l1, const char *l2, const char *l3) {
+    canvas_init(&CANVAS);
+    center(36, "MAPPY", C_LBLUE, 3);
+    if (head) center(80, head, C_WHITE, 1);
+    if (l1) center(100, l1, C_GRAY, 1);
+    if (l2) center(112, l2, C_GRAY, 1);
+    if (l3) center(124, l3, C_GRAY, 1);
+    center(176, "RESET: BACK TO THE MENU", C_LBLUE, 1);
+    mpcv_canvas(&enc, &CANVAS.px[0][0]);
+}
+
+// serve the console, a list a frame, for us microseconds (forever: 0)
+static void serve_for(uint32_t us) {
+    uint32_t t0 = time_us_32();
+    while (!us || time_us_32() - t0 < us) {
+        if (!new_frames()) continue;
+        mpcv_sound_pcm(&enc, NULL, 0);
+        send();
     }
 }
 
-// ---- the step: every TV frame -----------------------------------------------------------
-static void step(void) {
-    player_step();
-    usb_step();
-    pads_step();
-    // YOUR CODE: your plugin's step
+static void __attribute__((noreturn)) fail(const char *why, const char *l2, const char *l3, const char *menu_note) {
+    message("IT CAN'T START", why, l2, l3);
+    cvf_note(menu_note);
+    serve_for(0);
+    for (;;) tight_loop_contents();
 }
 
-// ---- the picture ------------------------------------------------------------------------
-// The frame kernel sets up Graphics II: 768 names at $1800 say which tile
-// is at each 8x8 place, and each third of the screen has its own 256 tiles:
-// patterns at $0000, colors at $2000, 8 bytes a tile. Here tiles 32-95 are
-// the font, in each third, and a place's name is its character.
-//
-// want[] is the video memory the plugin wants and shown[] what the console
-// will hold once the lists sent so far have run. Each frame's list carries
-// as many of the bytes that differ as fit in its time (the kit's examples/frames).
-#define NAMES    0x1800
-#define SPRITES  0x1B00         // (the sprites' tables, to $1FFF: not written)
-#define COLORS   0x2000
-#define VRAM_END 0x3800
-static uint8_t want[VRAM_END], shown[VRAM_END];
-
-static void picture_start(void) {
-    for (int third = 0; third < 3; third++)
-        for (int ch = 32; ch < 96; ch++)
-            for (int r = 0; r < 8; r++) {
-                const int i = third * 0x800 + ch * 8 + r;
-                want[i] = font8[ch - 32][r];
-                want[COLORS + i] = 0xF0 | C_BLACK;      // white on black
-                shown[i] = (uint8_t)~want[i];           // what the console has there isn't known: send it
-                shown[COLORS + i] = (uint8_t)~want[COLORS + i];
-            }
-    memset(shown + NAMES, 0xFF, 768);
+// between a file's sectors: the console keeps its picture
+static void card_tick(void) {
+    if (!new_frames()) return;
+    mpcv_sound_pcm(&enc, NULL, 0);
+    send();
 }
 
-// The whole picture, every frame
-static void picture(void) {
-    // YOUR CODE: your picture. This one is the rows of text.
-    for (int r = 0; r < ROWS; r++) {
-        const int n = (int)strlen(text[r]);
-        for (int col = 0; col < 32; col++) {
-            const int i = col - 2;                      // two places each side: the TV cuts the edges
-            const char ch = i >= 0 && i < n ? text[r][i] : ' ';
-            want[NAMES + 32 * r + col] = (uint8_t)(ch >= 32 && ch < 96 ? ch : '?');
-        }
+// ---- the controls ----------------------------------------------------------------------
+// The kit's arcade keys (.claude/skills/parrot-cart-plugin/references/
+// porting.md), as the board's ports have them (active low, mp.h): COINS
+// 0x01 coin 1; P1 0x02 right, 0x08 left; BUTTONS 0x01 the button (doors),
+// 0x04 1P start, 0x08 2P start. A coin is a pulse of 6 lists from the
+// press, and the key has to be up for 3 lists before the next one counts.
+// Mappy's stick has two ways: left and right together are neither.
+static void controls(void) {
+    uint8_t joy, fire, lines;
+    cvf_input(&joy, &fire, &lines);                     // low = pressed
+    const int key = cvin_decode_key(lines);
+    uint32_t dirs = 0, buttons = 0;
+    gamepad_t p;
+    if (cvusb_pad(0, &p)) {
+        dirs = cvusb_pad_dirs(&p);
+        buttons = p.buttons;
     }
+    const bool right = !(joy & 2) || (dirs & GP_RIGHT), left = !(joy & 8) || (dirs & GP_LEFT);
+    const bool door = (fire & 3) != 3 || (buttons & (GP_SOUTH | GP_EAST | GP_WEST | GP_NORTH));
+    const bool coin = key == CVIN_STAR || key == CVIN_HASH || (buttons & GP_MINUS);
+    const bool start1 = key == 1 || (buttons & GP_PLUS);
+    const bool start2 = key == 2;
+    // One coin a press: the coin switch down for 6 frames (lists), then up
+    // for 3 before the next coin, so two quick presses are two coins.
+    static bool coin_held;
+    static int coins_owed, coin_down, coin_up;
+    if (coin && !coin_held && coins_owed < 2) coins_owed++;
+    coin_held = coin;
+    if (!coin_down && !coin_up && coins_owed) { coins_owed--; coin_down = 6; }
+    const bool coin_switch = coin_down > 0;
+    if (coin_down) { if (!--coin_down) coin_up = 3; }
+    else if (coin_up) coin_up--;
+    uint8_t coins = 0, p1 = 0, b = 0;
+    if (coin_switch) coins |= 0x01;
+    if (right && !left) p1 |= 0x02;
+    if (left && !right) p1 |= 0x08;
+    if (door) b |= 0x01;
+    if (start1) b |= 0x04;
+    if (start2) b |= 0x08;
+    mp_in.coins = (uint8_t)(0x0f & ~coins);
+    mp_in.p1 = (uint8_t)(0x0f & ~p1);
+    mp_in.buttons = (uint8_t)(0x0f & ~b);
 }
 
-// What each command costs in Z80 cycles (gbkernel.asm's header)
-#define FRAME_T     (262 * 228)
-#define BLANK_T     (70 * 228)
-#define BLANK_LIMIT (BLANK_T - 2000)    // the first part must end inside the blank...
-#define LIST_LIMIT  (FRAME_T - 4000)    // ...and the list well inside the frame
-#define RUN_T       106
-#define PSG_T(n)    (75 + 52 * (n))     // with the ~29 T the sound chip holds the Z80 for at each byte
-#define END_T       54
-static uint8_t list[CVF_LIST_MAX];
-static size_t len;
-static uint32_t cost, cursor;
+// ---- the game ------------------------------------------------------------------------
+static uint32_t published, frames_at_start, us_max, pics_at_note;
 
-// The bytes of want[] that differ from shown[], as runs, until `limit`
-// cycles are used up at per_byte cycles a byte. Everything in a list must
-// be safe to run twice: with nothing new, the console runs the last again.
-static void diff(uint32_t limit, uint32_t per_byte) {
-    for (uint32_t scanned = 0; scanned < VRAM_END;) {
-        if (cursor == SPRITES) cursor = COLORS;
-        const uint32_t i = cursor, end = i < NAMES ? NAMES : i < SPRITES ? SPRITES : VRAM_END;
-        if (want[i] == shown[i]) {
-            cursor = (cursor + 1) % VRAM_END;
-            scanned++;
-            continue;
-        }
-        if (cost + RUN_T + per_byte > limit) return;
-        // a run from here: up to 255 bytes, to the table's end, while the
-        // time lasts, stopping at 4 bytes in a row that are right already
-        uint32_t n = 0, same = 0;
-        while (n < 255 && i + n < end && cost + RUN_T + per_byte * (n + 1) <= limit) {
-            same = want[i + n] == shown[i + n] ? same + 1 : 0;
-            if (same == 4) break;
-            n++;
-        }
-        n -= same == 4 ? 3 : same;                      // not the right ones at its end
-        list[len++] = 1;
-        list[len++] = (uint8_t)i;
-        list[len++] = (uint8_t)(i >> 8 | 0x40);
-        list[len++] = (uint8_t)n;
-        memcpy(list + len, want + i, n);
-        memcpy(shown + i, want + i, n);                 // it will be so, once this list has run
-        len += n;
-        cost += RUN_T + per_byte * n;
-        cursor = (i + n) % VRAM_END;
-        scanned += n;
-    }
+// one list: the controls, the board for the list's time, the list made,
+// then handed over as soon as core 1 takes it
+static void game_list(void) {
+    uint32_t t0 = time_us_32();
+    controls();
+    list_len = mprun_list(&run, list);
+    uint32_t us = time_us_32() - t0;
+    if (us > us_max) us_max = us;
+    while (!cvf_publish(list, list_len)) tasks();
+    published++;
+    tasks();
 }
 
-// ---- the sound ----------------------------------------------------------------------------
-// The sound chip's ten bytes: tone low, tone high and volume for voices 0
-// to 2, then the noise's volume (a volume's low 4 bits: 0 loudest, 15 off).
-// Every list carries all of them, changed or not. Now and then the console
-// reads a byte from the cart wrong, and a register written only once would
-// keep the wrong value, a drone, until RESET.
-static uint8_t psg[10] = {0x80, 0x00, 0x9F, 0xA0, 0x00, 0xBF, 0xC0, 0x00, 0xDF, 0xFF};   // all off
-
-static void sound(void) {
-    // YOUR CODE: your sound, into psg[]. Make it about as loud as an
-    // ordinary ColecoVision cartridge (docs/testing.md, "How loud").
-    list[len++] = 2;
-    list[len++] = sizeof psg;
-    memcpy(list + len, psg, sizeof psg);
-    len += sizeof psg;
-    cost += PSG_T(sizeof psg);
-}
-
-// ---- the start, and the loop ------------------------------------------------------------
-static void rows_start(void) {
-    say(ROW_TITLE, C_LYELLOW, "%s", NAME);
-    say(ROW_BY, C_GRAY, "BY %s", BY);
-    say(ROW_RESET, C_GRAY, "RESET: BACK TO THE MENU");
+// the menu's bottom line, should RESET come: pictures a second, lists the
+// console ran again for want of a new one (since the start), the slowest
+// list this second, the bus's odd selects
+static void update_note(void) {
+    static uint32_t t_last;
+    uint32_t t = time_us_32();
+    if (t - t_last < NOTE_US) return;
+    int32_t again = (int32_t)(cvf_frames() - frames_at_start) - (int32_t)(published - 1);
+    if (again < 0) again = 0;
+    unsigned per_s = MIN(run.pictures - pics_at_note, 99u), ms = MIN(us_max / 1000, 99u), tenths = us_max / 100 % 10;
+    uint32_t unsel, early, unhdr;
+    cvf_bus_counts(&unsel, &early, &unhdr);
+    char n[48];
+    snprintf(n, sizeof n, TAG " %u/s %ldL %u.%ums s%u h%u", per_s, (long)MIN(again, 9999), ms, tenths,
+             (unsigned)MIN(unsel, 999u), (unsigned)MIN(unhdr, 999u));
+    cvf_note(n);
+    t_last = t;
+    pics_at_note = run.pictures;
+    us_max = 0;
 }
 
 int main(void) {
-    // First thing: the console is parked, waiting for a cartridge to appear.
     static const cvf_config_t cfg = {gbkernel_bin, GBKERNEL_BIN_LEN, handoff_bin, HANDOFF_BIN_LEN};
     cvf_start(&cfg);
     cvd_start();
-    picture_start();
-    cvin_init(&in);
-    leave_note(NAME);
-    rows_start();
-    cvusb_start();              // after the kernel's start: a host, for what is plugged into the hub
+    cvd_stage(1);
+    cvusb_start();                          // after the kernel's start: a host, for what is plugged into the hub
+    mpcv_init(&enc);
+    scratch = mpcv_scratch(&scratch_n);
+    message("LOOKING FOR THE ROMS", "IN " MPCARD_HOME " ON THE CARD", NULL, NULL);
+    serve_for(OPEN_US);
 
-    // YOUR CODE: set up your plugin here
+    if (!cvsd_card_in() || !cvsd_init()) fail(cvsd_card_in() ? "THE CARD DIDN'T ANSWER" : "NO CARD IN THE SLOT", NULL, NULL, GAME ": no card");
+    // the card's state, its reads and the graphics' ROMs in the scratch too
+    // (no message is drawn until they are done with: fail() draws over
+    // them, and mp_init decodes the graphics before the first picture)
+    fs_t *fs = (fs_t *)(void *)scratch;
+    size_t fs_room = (sizeof(fs_t) + 7) & ~(size_t)7;
+    mp_rom_gfx = scratch + scratch_n - MP_GFX_BYTES;
+    if (fs_mount(fs, cvsd_read) != FS_OK) fail("NO FAT OR EXFAT ON THE CARD", NULL, NULL, GAME ": card didn't mount");
+    cvd_stage(2);
+    watchdog_enable(WATCHDOG_MS, true);
+    uint32_t found = mpcard_load_roms(fs, scratch + fs_room, (uint32_t)(scratch_n - fs_room - MP_GFX_BYTES), card_tick);
+    cvd_stage(3);
+    if (found != MPROMS_ALL) {
+        int missing = 0;
+        const char *first = "";
+        for (int i = 0; i < MP_ROM_FILES; i++)
+            if (!(found & 1u << i) && !missing++) first = mp_rom_files[i].name;
+        char l2[40], note[48];
+        if (!found) snprintf(l2, sizeof l2, "NONE OF ITS %d FILES IS THERE", MP_ROM_FILES);
+        else snprintf(l2, sizeof l2, "%d OF %d MISSING: %.14s", missing, MP_ROM_FILES, first);
+        for (char *c = l2; *c; c++)
+            if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 'a' + 'A');
+        snprintf(note, sizeof note, GAME ": %d ROM%s missing", missing, missing == 1 ? "" : "s");   // (32 characters at most)
+        fail("PUT MAME'S MAPPY ROMS, OR", "MAPPY.ZIP, IN " MPCARD_HOME, l2, note);
+    }
+    mproms_roms(&roms);
+    mpsnd_init(roms.wave);
+    mp_init(&roms);                         // MAME's default switches (mp.h); decodes the graphics from the scratch
+    mpcv_prepare();
+    mprun_start(&run, &enc);
+    cvd_stage(4);
+    cvf_note(GAME);
 
-    bool pending = false;       // a list is made and not taken yet
-    uint32_t seen = 0;
+    while (list_pending) tasks(), publish();          // the last message's list out first
+    frames_at_start = cvf_frames();
     for (;;) {
-        const uint32_t t = time_us_32();
-        // Every pass: is the console still on, has RESET been pressed? On
-        // RESET this doesn't return: the cart goes back to the menu.
-        cvf_task(t);
-        cvusb_task();           // every pass: the USB port's work (it never waits)
-        // Never drop a list: shown[] already counts on it. Offer it until it is taken.
-        if (pending && cvf_publish(list, len)) pending = false;
-        if (pending || cvf_frames() == seen) continue;
-        seen = cvf_frames();                            // a TV frame has started: make the list for the next
-        uint8_t joy, fire, key;
-        cvf_input(&joy, &fire, &key);                   // the controller, as the console read it this frame
-        cvin_frame(&in, joy, fire, key);
-        step();
-        picture();
-        len = 0;
-        cost = 480;                                     // the kernel's own start of a frame
-        sound();                                        // the whole sound chip, every list
-        diff(BLANK_LIMIT, 23);                          // the blank part: 23 cycles a byte
-        list[len++] = 0;
-        cost += END_T;
-        diff(LIST_LIMIT, 31);                           // while the picture is drawn: 31
-        list[len++] = 0;
-        pending = true;
+        game_list();
+        update_note();
     }
 }

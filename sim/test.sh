@@ -112,16 +112,42 @@ tree() {
 }
 
 # ---- the plugin in src/ (tools/new-plugin.py rewrites this part) ----
-# Each run fails on any rule the models see (test/host/host.c). With expect,
-# add what your plugin's log must show, as grep -E patterns:
-# its note ('note "Saved"'), PSG bytes ('psg 9F'), MIDI ('midi 90 3C').
+# Mappy plays from the user's ROMs: MP_ROMS names MAME's mappy.zip (never
+# in the repository). The card is a folder here, so the runs have names of
+# their own (a folder's reads and times aren't an image's); the message
+# with no ROMs is the same picture as test/run.sh's.
+mp_folder() {                           # mp_folder DIR [ZIP]: a card folder, /MAPPY holding ZIP
+    rm -rf "$1"; mkdir -p "$1/MAPPY" "$1/PLUGINS"
+    [ -n "$2" ] && cp "$2" "$1/MAPPY/mappy.zip"
+    printf 'not a ROM\n' > "$1/MAPPY/readme.txt"
+}
+if wanted mappy-noroms; then
+    mp_folder "$out/card-mp-noroms"
+    run mp-noroms "$kit/src" --ms 1500 --card "$out/card-mp-noroms"
+    expect 'note "Mappy: 11 ROMs missing"' 'back to the menu' 'psg 80 00 9F A0 00 BF C0 00 DF FF'
+    same_as mappy-noroms picture
+fi
 if wanted mappy; then
-    run mappy "$kit/src" --ms 3000 --script "500:joy=up+fire 900:joy= 1200:key=5 1500:key= 2000:joy=fire2 2300:joy="
-    expect 'back to the menu'
+    if [ -n "$MP_ROMS" ]; then
+        mp_folder "$out/card-mp" "$MP_ROMS"
+        run mp-game "$kit/src" --ms 40000 --card "$out/card-mp" \
+            --script "17000:key=* 17150:key= 18000:key=1 18150:key= 19000:joy=right 21000:joy=left+fire 21200:joy=left 24000:joy=right 27000:joy="
+        expect 'note "MP [0-9]+/s' 'back to the menu, its bottom line "MP' 'psg .*E4 FF'
+        rm -rf "$out/card-mp"
+    else
+        echo "mp-game"; echo "  (MP_ROMS isn't set: MAME's mappy.zip, for the game)"
+    fi
 fi
 if wanted mappy-usb; then
-    run mappy-usb "$kit/src" --ms 4000 --script "2000:pad=south+l 2100:lstick=1500,-900 2200:rstick=-2048,2047 2400:pad=east+up 3800:snap=usb"
-    expect 'usb: the port is a host' 'back to the menu'
+    if [ -n "$MP_ROMS" ]; then
+        mp_folder "$out/card-mp-usb" "$MP_ROMS"
+        run mp-usb "$kit/src" --ms 30000 --card "$out/card-mp-usb" \
+            --script "1000:pad=up 17000:pad=minus 17150:pad=up 18000:pad=plus 18150:pad=up 19000:pad=right 21000:pad=south 21200:lstick=-1800,0 24000:pad=east 29000:snap=usb"
+        expect 'usb: the port is a host' 'back to the menu, its bottom line "MP'
+        rm -rf "$out/card-mp-usb"
+    else
+        echo "mp-usb"; echo "  (MP_ROMS isn't set: MAME's mappy.zip, for the game)"
+    fi
 fi
 # ---- the examples ----
 # (left out with examples/: tools/new-plugin.py --examples keeps them)

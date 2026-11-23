@@ -9,6 +9,7 @@
 //   namco/mappy_v.cpp   the palette, the tilemap, the sprites
 //   machine/namcoio.cpp the 58XX custom I/O chip
 //   machine/74259.cpp   the latch (every output falls to 0 at reset)
+//   machine/74157.cpp   the DIP switches' multiplexer
 //   emu/screen.cpp      the VBLANK, VBLANK end and scanline 0 timers
 //   emu/sound.cpp       the sound manager's 50 Hz update timer
 //
@@ -255,10 +256,34 @@ static inline void sub_wr(uint16_t a, uint8_t v) {
 	}
 }
 
+// The wait loops. Each CPU spends most of its time in a loop of two
+// instructions, LDA addr and BEQ back (5 and 3 cycles), until its interrupt
+// handler sets that byte: the main CPU at $A021 on $1382, the sub CPU at
+// $E052 on $010A. Inside a CPU's timeslice nothing else runs (MAME's
+// scheduler runs one CPU at a time, and its timers and interrupts come
+// between slices), so the byte can't change there. At the loop's LDA, with
+// the byte 0, the turns the slice still has room for are taken off its
+// cycles at once, leaving at least one cycle, and the loop then runs on as
+// before: the same cycles, registers and memory at every point the other
+// CPU or a timer can see. (Only if the ROMs hold the loop: idle_ok.)
+static bool idle_ok;
+// the ROM has the loop at offset at: LDA addr (extended), BEQ back to it
+static bool wait_loop(const uint8_t *rom, unsigned at, uint16_t addr) {
+	enum { LDA_EXTENDED = 0xb6, BEQ = 0x27 };
+	return rom[at] == LDA_EXTENDED && (rom[at + 1] << 8 | rom[at + 2]) == addr && rom[at + 3] == BEQ && (int8_t)rom[at + 4] == -5;
+}
+#define IDLE_TURN 8
+#define IDLE_SKIP(c, at, byte) do { \
+		if ((c)->pc == (at) && idle_ok && !(byte) && (c)->icount > IDLE_TURN) \
+			(c)->icount -= ((c)->icount - 1) / IDLE_TURN * IDLE_TURN; \
+	} while (0)
+
 #ifdef MP_TRACE
 void (*mp_trace)(int cpu, uint64_t cycles);
 uint64_t sched_total_cycles(int d);
 #define M6809_TRACE(c) do { if (mp_trace) mp_trace(D_MAIN, sched_total_cycles(D_MAIN)); } while (0)
+#else                                   // (the tests' traces go an instruction at a time, as MAME's)
+#define M6809_TRACE(c) IDLE_SKIP(c, 0xa021, mp_mem[0x1382])
 #endif
 #define M6809_NAME(x) mainc_##x
 #define M6809_RD(a) main_rd(a)
@@ -269,9 +294,11 @@ uint64_t sched_total_cycles(int d);
 #undef M6809_RD
 #undef M6809_WR
 
-#ifdef MP_TRACE
 #undef M6809_TRACE
+#ifdef MP_TRACE
 #define M6809_TRACE(c) do { if (mp_trace) mp_trace(D_SUB, sched_total_cycles(D_SUB)); } while (0)
+#else
+#define M6809_TRACE(c) IDLE_SKIP(c, 0xe052, mp_snd[0x10a])
 #endif
 #define M6809_NAME(x) subc_##x
 #define M6809_RD(a) sub_rd(a)
@@ -414,8 +441,10 @@ static void vbstart(int param) {
 	}
 	// vblank_irq
 	if (main_irq_mask) sched_set_input(L_MAIN_IRQ, SCHED_ASSERT_LINE);
-	if (!io[0].reset) sched_timer_adjust(tm_io[0], SCHED_USEC(50), 0, SCHED_NEVER);
-	if (!io[1].reset) sched_timer_adjust(tm_io[1], SCHED_USEC(50), 1, SCHED_NEVER);
+	// (a chip held in reset gets no timer. Its timer is set to never all the
+	// same: lib/sched takes a second off every timer's start each second, and
+	// one left alone for 9 seconds would run past int64's end)
+	for (int c = 0; c < 2; c++) sched_timer_adjust(tm_io[c], io[c].reset ? SCHED_NEVER : SCHED_USEC(50), c, SCHED_NEVER);
 	if (sub_irq_mask) sched_set_input(L_SUB_IRQ, SCHED_ASSERT_LINE);
 	sched_timer_adjust(tm_vbstart, FRAME_PERIOD, 0, SCHED_NEVER);
 	sched_timer_adjust(tm_vbend, VBLANK_PERIOD, 0, SCHED_NEVER);
@@ -509,6 +538,7 @@ int mp_tile_index(int col, int row) {  // mappy_tilemap_scan: 36 columns, 60 row
 	return col + (row << 5);
 }
 
+#if !(defined(PICO_ON_DEVICE) && PICO_ON_DEVICE)        // (the tests'; its 64K isn't the cart's to spare)
 void mp_render(uint16_t *px) {
 	static uint8_t hi[MP_W * MP_H];     // the pixel is a category 1 tile's
 	for (int y = 0; y < MP_H; y++) {
@@ -558,6 +588,7 @@ void mp_render(uint16_t *px) {
 			}
 	}
 }
+#endif
 
 // ---- power on and reset ------------------------------------------------------------------
 static void machine_reset(void) {
@@ -580,6 +611,7 @@ static void machine_reset(void) {
 void mp_init(const mp_roms_t *roms) {
 	rom_main = roms->maincpu;
 	rom_sub = roms->sub;
+	idle_ok = wait_loop(rom_main, 0xa021 - 0xa000, 0x1382) && wait_loop(rom_sub, 0xe052 - 0xe000, 0x010a);
 	decode(roms);
 	palette(roms->proms);
 	memset(mp_mem, 0, sizeof mp_mem);

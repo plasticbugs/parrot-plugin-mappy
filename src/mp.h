@@ -72,7 +72,7 @@ extern uint32_t mp_tile_dirty[0x800 / 32];   // a bit for each tile whose code o
 // The screen as MAME draws it at a VBLANK (screen_update_mappy): 288 x
 // 224 raw pens: 0-255 the tiles' (colour * 4 + pixel), 256-511 the
 // sprites' (256 + colour * 16 + pixel); mp_rgb[] is each as MAME's palette
-// makes it. Tests only (the cart's picture is mpcv.c's).
+// makes it. Tests only (the cart's picture is mpcv.c's): not built for the cart.
 void mp_render(uint16_t *px);
 // mappy_tilemap_scan: the video RAM offset of the tilemap's column (0-35,
 // raw x / 8) and row (0-59, raw y / 8 through the scroll); 0x7ff off screen

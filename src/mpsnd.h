@@ -15,9 +15,10 @@
 #include <stdint.h>
 
 // the samples' scale: MPSND_GAIN DAC levels for 1.0 of MAME's output (its
-// 32768). test/mp/level.sh measures the loudness against a cartridge's.
+// 32768): a game measures -24.1 dBFS by the kit's tools/listlevel.py, as
+// loud as an ordinary cartridge or a little under (test/mp/README.md).
 #ifndef MPSND_GAIN
-#define MPSND_GAIN 1400.0f
+#define MPSND_GAIN 2000.0f
 #endif
 
 void mpsnd_init(const uint8_t *wave_prom);      // power on (before mp_init)

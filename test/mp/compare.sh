@@ -27,8 +27,8 @@ out="$work/compare-$name"
 rm -rf "${out:?}"; mkdir -p "$out"
 cc -O2 -Wall -I"$src" -I"$lib" -I"$here" -o "$out/mp_host" "$here/mp_host.c" "$src/mp.c" "$src/mpsnd.c" -lm
 if [ "$name" = game ]; then
-    printf '300 coins 01\n306 coins 00\n360 buttons 04\n366 buttons 00\n' > "$out/start.txt"
-    "$out/mp_host" "$set_dir" -frames "$frames" -script "$out/start.txt" -bot 420 -record "$out/script.txt" 2>/dev/null
+    printf '1000 coins 01\n1006 coins 00\n1060 buttons 04\n1066 buttons 00\n' > "$out/start.txt"
+    "$out/mp_host" "$set_dir" -frames "$frames" -script "$out/start.txt" -bot 1120 -record "$out/script.txt" 2>/dev/null
 else
     : > "$out/script.txt"
 fi
