@@ -1,4 +1,1 @@
-- Text in the mansion keeps every letter's shape. "2ND" no longer reads "RND", and "1983" no longer reads "1985".
-- The points keep their shape too. "200" no longer reads "2oo".
-- The MAPPY logo on the title screen lines up with its shadow and reads as the arcade's logo.
-- A new menu icon.
+Hold both fire buttons and * on controller 1 for 2 seconds, or Select and Start on a USB pad, to go back to the menu. RESET still works too.
